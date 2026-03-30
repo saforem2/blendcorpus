@@ -4,6 +4,7 @@
 
 import hashlib
 import os
+import pickle
 import time
 
 import ezpz
@@ -262,7 +263,7 @@ class BuildCorpusDataset(torch.utils.data.Dataset):
                     for attempt in range(max_retries):
                         try:
                             return np.load(path, allow_pickle=True, mmap_mode="r")
-                        except (EOFError, ValueError, FileNotFoundError, OSError) as e:
+                        except (EOFError, ValueError, FileNotFoundError, OSError, pickle.UnpicklingError) as e:
                             if attempt < max_retries - 1:
                                 logger.warning(
                                     f" > retry {attempt + 1}/{max_retries} loading "
@@ -1140,7 +1141,7 @@ def _build_index_mappings(
         for attempt in range(max_retries):
             try:
                 return np.load(path, allow_pickle=True, mmap_mode="r")
-            except (EOFError, ValueError, FileNotFoundError, OSError) as e:
+            except (EOFError, ValueError, FileNotFoundError, OSError, pickle.UnpicklingError) as e:
                 if attempt < max_retries - 1:
                     logger.warning(
                         f" > retry {attempt + 1}/{max_retries} loading {label} "
