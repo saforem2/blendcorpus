@@ -208,6 +208,11 @@ class BuildCorpusDataset(torch.utils.data.Dataset):
             self.dataset_sample_index = np.zeros(self.num_samples, dtype=np.int64)
             if args.data_cache_path:
                 desc_hash = hashlib.md5(desc.encode("utf-8")).hexdigest()
+                # Broadcast hash from rank 0 so all ranks use the same paths
+                if torch.distributed.is_initialized():
+                    hash_list = [desc_hash]
+                    torch.distributed.broadcast_object_list(hash_list, src=0)
+                    desc_hash = hash_list[0]
                 desc_path = os.path.join(args.data_cache_path, desc_hash + ".dsc")
                 index_path = os.path.join(
                     args.data_cache_path, desc_hash + "_index.npy"
