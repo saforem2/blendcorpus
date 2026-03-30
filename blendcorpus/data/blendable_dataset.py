@@ -66,87 +66,38 @@ class BlendableDataset(torch.utils.data.Dataset):
         self.desc = desc
         self.dataset_index = np.zeros(self.size, dtype=np.int64)
         self.dataset_sample_index = np.zeros(self.size, dtype=np.int64)
-        if data_cache_path:
-            # Use a rank-independent hash: weights and size are the same on
-            # all ranks, but dataset.desc can differ due to round-robin
-            # building. Use only the deterministic fields for the hash.
-            stable_desc = f"Blendable dataset\nWeights: {weights}\nSize: {size}\n"
-            desc_hash = hashlib.md5(stable_desc.encode("utf-8")).hexdigest()
-            desc_path = os.path.join(data_cache_path, desc_hash + ".dsc")
-            index_path = os.path.join(data_cache_path, desc_hash + "_index.npy")
-            sample_index_path = os.path.join(
-                data_cache_path, desc_hash + "_sample_index.npy"
-            )
-            cache_hit = os.path.isfile(index_path) and os.path.isfile(sample_index_path)
-            cache_success = True
-            if torch.distributed.get_rank() == 0 and not cache_hit:
-                logger.info(
-                    " > WARNING: could not find index map files for blendable"
-                    " dataset, building indices on rank 0 ...",
-                )
-                dataset_index, dataset_sample_index = _build_indices()
+        # Build blending indices on rank 0 and broadcast to all ranks.
+        # Previous approach used filesystem caching, but Lustre metadata
+        # propagation delays cause FileNotFoundError on multi-node runs.
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank == 0:
+            logger.info("> building blendable dataset indices on rank 0 ...")
+            self.dataset_index, self.dataset_sample_index = _build_indices()
+            # Also save to cache for future single-rank reuse
+            if data_cache_path:
                 try:
-                    logger.debug(" > saving index map files")
-                    start_time = time.perf_counter()
-                    os.makedirs(os.path.dirname(index_path), exist_ok=True)
-                    with open(desc_path, "wt") as fd:
-                        fd.write(desc)
-                    np.save(index_path, dataset_index, allow_pickle=True)
-                    np.save(
-                        sample_index_path, dataset_sample_index, allow_pickle=True
-                    )
-                    logger.info(
-                        f" > finished saving index map files in {time.perf_counter() - start_time} seconds"
-                    )
+                    stable_desc = f"Blendable dataset\nWeights: {weights}\nSize: {size}\n"
+                    desc_hash = hashlib.md5(stable_desc.encode("utf-8")).hexdigest()
+                    os.makedirs(data_cache_path, exist_ok=True)
+                    np.save(os.path.join(data_cache_path, desc_hash + "_index.npy"),
+                            self.dataset_index, allow_pickle=True)
+                    np.save(os.path.join(data_cache_path, desc_hash + "_sample_index.npy"),
+                            self.dataset_sample_index, allow_pickle=True)
+                    logger.info(f"> saved blendable index cache to {data_cache_path}")
                 except OSError:
-                    logger.info(
-                        " ".join(
-                            [
-                                "There was an error trying to create the data",
-                                f"cache directory ({data_cache_path})",
-                                "or a file in it. This is set with the",
-                                "--data-cache-path argument. Please ensure you",
-                                "have write access to this directory or specify one",
-                                "that you do have write access to.",
-                            ]
-                        )
-                    )
-                    cache_success = False
-                self.dataset_index = dataset_index
-                self.dataset_sample_index = dataset_sample_index
-            # XXX:
-            # I don't think the following piece of code is necessary any more;
-            # I commented them out now
-            # counts = get_accelerator().LongTensor([cache_success])
-            # torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
-            # torch.distributed.all_reduce(counts, group=mpu.get_pipeline_model_parallel_group())
-            # if counts[0].item() != (
-            #         torch.distributed.get_world_size() //
-            #         torch.distributed.get_world_size(group=mpu.get_tensor_model_parallel_group()) //
-            #         torch.distributed.get_world_size(group=mpu.get_sequence_parallel_group())):
-            #     logger.info("Data index creation unsuccessful, exiting.")
-            #     exit()
-            torch.distributed.barrier(group=mpu.get_data_parallel_group())
-            torch.distributed.barrier(group=mpu.get_pipeline_model_parallel_group())
-            torch.distributed.barrier(group=mpu.get_data_parallel_group())
+                    logger.warning(f"> failed to save blendable index cache to {data_cache_path}")
 
-            if torch.distributed.get_rank() != 0 or cache_hit:
-                # Non-rank-0 ranks load from files that rank 0 just wrote.
-                # Rank 0 with a cache hit also needs to load (it skipped building).
-                start_time = time.perf_counter()
-                logger.info(f"> loading blendable dataset index: {index_path}")
-                self.dataset_index = np.load(index_path, allow_pickle=True, mmap_mode="r")
-                assert self.dataset_index.size == self.size
-                logger.info(f"> loading blendable dataset sample index: {sample_index_path}")
-                self.dataset_sample_index = np.load(
-                    sample_index_path, allow_pickle=True, mmap_mode="r"
-                )
-                assert self.dataset_sample_index.size == self.size
-                logger.info(
-                    f"> finished loading in {time.perf_counter() - start_time} seconds"
-                )
-            # else: rank 0 already set self.dataset_index/sample_index above
-        else:
+        # Broadcast indices from rank 0 to all ranks via torch.distributed
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            idx_tensor = torch.from_numpy(self.dataset_index).long()
+            sample_tensor = torch.from_numpy(self.dataset_sample_index).long()
+            torch.distributed.broadcast(idx_tensor, src=0)
+            torch.distributed.broadcast(sample_tensor, src=0)
+            if rank != 0:
+                self.dataset_index = idx_tensor.numpy()
+                self.dataset_sample_index = sample_tensor.numpy()
+            logger.info(f"> rank {rank}: blendable indices ready (broadcast)")
+        elif not torch.distributed.is_initialized():
             self.dataset_index, self.dataset_sample_index = _build_indices()
 
         # Check size
