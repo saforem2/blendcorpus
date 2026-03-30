@@ -87,10 +87,10 @@ class BlendableDataset(torch.utils.data.Dataset):
                     os.makedirs(os.path.dirname(index_path), exist_ok=True)
                     with open(desc_path, "wt") as fd:
                         fd.write(desc)
-                        np.save(index_path, dataset_index, allow_pickle=True)
-                        np.save(
-                            sample_index_path, dataset_sample_index, allow_pickle=True
-                        )
+                    np.save(index_path, dataset_index, allow_pickle=True)
+                    np.save(
+                        sample_index_path, dataset_sample_index, allow_pickle=True
+                    )
                     logger.info(
                         f" > finished saving index map files in {time.perf_counter() - start_time} seconds"
                     )

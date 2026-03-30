@@ -1120,6 +1120,13 @@ def _build_index_mappings(
             print("write access to.")
             data_cache_success = False
 
+    # Barrier to ensure all ranks have finished writing index files
+    # before any rank tries to load them. Critical on parallel filesystems
+    # (e.g. Lustre) where writes from one node may not be immediately
+    # visible to other nodes.
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
     # Load mappings.
     start_time = time.time()
     logger.debug(f" > loading doc-idx mapping from {idx_path['doc']}")
