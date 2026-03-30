@@ -67,14 +67,11 @@ class BlendableDataset(torch.utils.data.Dataset):
         self.dataset_index = np.zeros(self.size, dtype=np.int64)
         self.dataset_sample_index = np.zeros(self.size, dtype=np.int64)
         if data_cache_path:
-            desc_hash = hashlib.md5(desc.encode("utf-8")).hexdigest()
-            # Broadcast hash from rank 0 so all ranks use the same file paths.
-            # Different ranks may have different desc strings (due to round-robin
-            # dataset building), producing different hashes.
-            if torch.distributed.is_initialized():
-                hash_list = [desc_hash]
-                torch.distributed.broadcast_object_list(hash_list, src=0)
-                desc_hash = hash_list[0]
+            # Use a rank-independent hash: weights and size are the same on
+            # all ranks, but dataset.desc can differ due to round-robin
+            # building. Use only the deterministic fields for the hash.
+            stable_desc = f"Blendable dataset\nWeights: {weights}\nSize: {size}\n"
+            desc_hash = hashlib.md5(stable_desc.encode("utf-8")).hexdigest()
             desc_path = os.path.join(data_cache_path, desc_hash + ".dsc")
             index_path = os.path.join(data_cache_path, desc_hash + "_index.npy")
             sample_index_path = os.path.join(
