@@ -126,18 +126,22 @@ class BlendableDataset(torch.utils.data.Dataset):
             torch.distributed.barrier(group=mpu.get_pipeline_model_parallel_group())
             torch.distributed.barrier(group=mpu.get_data_parallel_group())
 
-            start_time = time.perf_counter()
-            logger.info(f"> loading blendable dataset index: {index_path}")
-            self.dataset_index = np.load(index_path, allow_pickle=True, mmap_mode="r")
-            assert self.dataset_index.size == self.size
-            logger.info(f"> loading blendable dataset sample index: {sample_index_path}")
-            self.dataset_sample_index = np.load(
-                sample_index_path, allow_pickle=True, mmap_mode="r"
-            )
-            assert self.dataset_sample_index.size == self.size
-            logger.info(
-                f"> finished loading in {time.perf_counter() - start_time} seconds"
-            )
+            if torch.distributed.get_rank() != 0 or cache_hit:
+                # Non-rank-0 ranks load from files that rank 0 just wrote.
+                # Rank 0 with a cache hit also needs to load (it skipped building).
+                start_time = time.perf_counter()
+                logger.info(f"> loading blendable dataset index: {index_path}")
+                self.dataset_index = np.load(index_path, allow_pickle=True, mmap_mode="r")
+                assert self.dataset_index.size == self.size
+                logger.info(f"> loading blendable dataset sample index: {sample_index_path}")
+                self.dataset_sample_index = np.load(
+                    sample_index_path, allow_pickle=True, mmap_mode="r"
+                )
+                assert self.dataset_sample_index.size == self.size
+                logger.info(
+                    f"> finished loading in {time.perf_counter() - start_time} seconds"
+                )
+            # else: rank 0 already set self.dataset_index/sample_index above
         else:
             self.dataset_index, self.dataset_sample_index = _build_indices()
 

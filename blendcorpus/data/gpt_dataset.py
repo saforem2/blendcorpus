@@ -232,15 +232,15 @@ class BuildCorpusDataset(torch.utils.data.Dataset):
                         os.makedirs(os.path.dirname(index_path), exist_ok=True)
                         with open(desc_path, "wt") as fd:
                             fd.write(desc)
-                            np.save(index_path, dataset_index, allow_pickle=True)
-                            np.save(
-                                sample_index_path,
-                                dataset_sample_index,
-                                allow_pickle=True,
-                            )
-                            logger.info(
-                                f" > finished saving {self.dataset_builders[0].corpus} corpus index map files in {time.perf_counter() - start_time} seconds"
-                            )
+                        np.save(index_path, dataset_index, allow_pickle=True)
+                        np.save(
+                            sample_index_path,
+                            dataset_sample_index,
+                            allow_pickle=True,
+                        )
+                        logger.info(
+                            f" > finished saving {self.dataset_builders[0].corpus} corpus index map files in {time.perf_counter() - start_time} seconds"
+                        )
                     except OSError:
                         print(
                             f"There was an error trying to create the data cache directory ({args.data_cache_path})"
@@ -258,24 +258,28 @@ class BuildCorpusDataset(torch.utils.data.Dataset):
                 torch.distributed.barrier(group=mpu.get_data_parallel_group())
                 torch.distributed.barrier(group=mpu.get_pipeline_model_parallel_group())
                 torch.distributed.barrier(group=mpu.get_data_parallel_group())
-                start_time = time.perf_counter()
-                logger.info(
-                    f"> loading {self.dataset_builders[0].corpus} corpus dataset index: {index_path}"
-                )
-                self.dataset_index = np.load(
-                    index_path, allow_pickle=True, mmap_mode="r"
-                )
-                assert self.dataset_index.size == self.num_samples
-                logger.info(
-                    f"> loading {self.dataset_builders[0].corpus} corpus dataset sample index: {sample_index_path}"
-                )
-                self.dataset_sample_index = np.load(
-                    sample_index_path, allow_pickle=True, mmap_mode="r"
-                )
-                assert self.dataset_sample_index.size == self.num_samples
-                logger.info(
-                    f"> finished loading in {time.perf_counter() - start_time} seconds"
-                )
+                if torch.distributed.get_rank() != 0 or cache_hit:
+                    # Non-rank-0 loads from files; rank 0 with cache hit also loads.
+                    # Rank 0 that just built keeps its in-memory arrays.
+                    start_time = time.perf_counter()
+                    corpus_name = self.dataset_builders[0].corpus
+                    logger.info(
+                        f"> loading {corpus_name} corpus dataset index: {index_path}"
+                    )
+                    self.dataset_index = np.load(
+                        index_path, allow_pickle=True, mmap_mode="r"
+                    )
+                    assert self.dataset_index.size == self.num_samples
+                    logger.info(
+                        f"> loading {corpus_name} corpus dataset sample index: {sample_index_path}"
+                    )
+                    self.dataset_sample_index = np.load(
+                        sample_index_path, allow_pickle=True, mmap_mode="r"
+                    )
+                    assert self.dataset_sample_index.size == self.num_samples
+                    logger.info(
+                        f"> finished loading in {time.perf_counter() - start_time} seconds"
+                    )
             else:
                 self.dataset_index, self.dataset_sample_index = _build_indices()
 
