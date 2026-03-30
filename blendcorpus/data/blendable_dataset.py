@@ -126,14 +126,26 @@ class BlendableDataset(torch.utils.data.Dataset):
             torch.distributed.barrier(group=mpu.get_pipeline_model_parallel_group())
             torch.distributed.barrier(group=mpu.get_data_parallel_group())
 
+            def _load_with_retry(path, label, max_retries=30, delay=2.0):
+                for attempt in range(max_retries):
+                    try:
+                        return np.load(path, allow_pickle=True, mmap_mode="r")
+                    except (EOFError, ValueError, FileNotFoundError, OSError) as e:
+                        if attempt < max_retries - 1:
+                            logger.warning(
+                                f" > retry {attempt + 1}/{max_retries} loading "
+                                f"{label} from {path}: {e}"
+                            )
+                            time.sleep(delay)
+                        else:
+                            raise
+
             start_time = time.perf_counter()
             logger.info(f"> loading blendable dataset index: {index_path}")
-            self.dataset_index = np.load(index_path, allow_pickle=True, mmap_mode="r")
+            self.dataset_index = _load_with_retry(index_path, "blendable-index")
             assert self.dataset_index.size == self.size
             logger.info(f"> loading blendable dataset sample index: {sample_index_path}")
-            self.dataset_sample_index = np.load(
-                sample_index_path, allow_pickle=True, mmap_mode="r"
-            )
+            self.dataset_sample_index = _load_with_retry(sample_index_path, "blendable-sample-index")
             assert self.dataset_sample_index.size == self.size
             logger.info(
                 f"> finished loading in {time.perf_counter() - start_time} seconds"

@@ -258,19 +258,32 @@ class BuildCorpusDataset(torch.utils.data.Dataset):
                 torch.distributed.barrier(group=mpu.get_data_parallel_group())
                 torch.distributed.barrier(group=mpu.get_pipeline_model_parallel_group())
                 torch.distributed.barrier(group=mpu.get_data_parallel_group())
+                def _load_with_retry(path, label, max_retries=30, delay=2.0):
+                    for attempt in range(max_retries):
+                        try:
+                            return np.load(path, allow_pickle=True, mmap_mode="r")
+                        except (EOFError, ValueError, FileNotFoundError, OSError) as e:
+                            if attempt < max_retries - 1:
+                                logger.warning(
+                                    f" > retry {attempt + 1}/{max_retries} loading "
+                                    f"{label} from {path}: {e}"
+                                )
+                                time.sleep(delay)
+                            else:
+                                raise
+
+                corpus_name = self.dataset_builders[0].corpus
                 start_time = time.perf_counter()
                 logger.info(
-                    f"> loading {self.dataset_builders[0].corpus} corpus dataset index: {index_path}"
+                    f"> loading {corpus_name} corpus dataset index: {index_path}"
                 )
-                self.dataset_index = np.load(
-                    index_path, allow_pickle=True, mmap_mode="r"
-                )
+                self.dataset_index = _load_with_retry(index_path, f"{corpus_name}-index")
                 assert self.dataset_index.size == self.num_samples
                 logger.info(
-                    f"> loading {self.dataset_builders[0].corpus} corpus dataset sample index: {sample_index_path}"
+                    f"> loading {corpus_name} corpus dataset sample index: {sample_index_path}"
                 )
-                self.dataset_sample_index = np.load(
-                    sample_index_path, allow_pickle=True, mmap_mode="r"
+                self.dataset_sample_index = _load_with_retry(
+                    sample_index_path, f"{corpus_name}-sample-index"
                 )
                 assert self.dataset_sample_index.size == self.num_samples
                 logger.info(
@@ -1120,16 +1133,32 @@ def _build_index_mappings(
             print("write access to.")
             data_cache_success = False
 
-    # Load mappings.
+    # Load mappings with retry — on parallel filesystems (Lustre), files
+    # written by one rank may not be immediately visible/complete on other
+    # nodes even after a barrier.
+    def _load_with_retry(path, label, max_retries=30, delay=2.0):
+        for attempt in range(max_retries):
+            try:
+                return np.load(path, allow_pickle=True, mmap_mode="r")
+            except (EOFError, ValueError, FileNotFoundError, OSError) as e:
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f" > retry {attempt + 1}/{max_retries} loading {label} "
+                        f"from {path}: {e}"
+                    )
+                    time.sleep(delay)
+                else:
+                    raise
+
     start_time = time.time()
     logger.debug(f" > loading doc-idx mapping from {idx_path['doc']}")
-    doc_idx = np.load(idx_path["doc"], allow_pickle=True, mmap_mode="r")
+    doc_idx = _load_with_retry(idx_path["doc"], "doc-idx")
 
     logger.debug(f" > loading sample-idx mapping from {idx_path['sample']}")
-    sample_idx = np.load(idx_path["sample"], allow_pickle=True, mmap_mode="r")
+    sample_idx = _load_with_retry(idx_path["sample"], "sample-idx")
 
     logger.debug(f" > loading shuffle-idx mapping from {idx_path['shuffle']}")
-    shuffle_idx = np.load(idx_path["shuffle"], allow_pickle=True, mmap_mode="r")
+    shuffle_idx = _load_with_retry(idx_path["shuffle"], "shuffle-idx")
 
     logger.debug(
         "    loaded indexed file in {:3.3f} seconds".format(time.time() - start_time)
