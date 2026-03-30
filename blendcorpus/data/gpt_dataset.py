@@ -1120,27 +1120,25 @@ def _build_index_mappings(
             print("write access to.")
             data_cache_success = False
 
-    # Barrier to ensure all ranks have finished writing index files
-    # before any rank tries to load them. Critical on parallel filesystems
-    # (e.g. Lustre) where writes from one node may not be immediately
-    # visible to other nodes.
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+    if not build_indices:
+        # This rank didn't build — load from files written by another rank.
+        # The caller's barrier (in build_train_valid_test_datasets) ensures
+        # these files are fully written before we reach here.
+        start_time = time.time()
+        logger.debug(f" > loading doc-idx mapping from {idx_path['doc']}")
+        doc_idx = np.load(idx_path["doc"], allow_pickle=True, mmap_mode="r")
 
-    # Load mappings.
-    start_time = time.time()
-    logger.debug(f" > loading doc-idx mapping from {idx_path['doc']}")
-    doc_idx = np.load(idx_path["doc"], allow_pickle=True, mmap_mode="r")
+        logger.debug(f" > loading sample-idx mapping from {idx_path['sample']}")
+        sample_idx = np.load(idx_path["sample"], allow_pickle=True, mmap_mode="r")
 
-    logger.debug(f" > loading sample-idx mapping from {idx_path['sample']}")
-    sample_idx = np.load(idx_path["sample"], allow_pickle=True, mmap_mode="r")
+        logger.debug(f" > loading shuffle-idx mapping from {idx_path['shuffle']}")
+        shuffle_idx = np.load(idx_path["shuffle"], allow_pickle=True, mmap_mode="r")
 
-    logger.debug(f" > loading shuffle-idx mapping from {idx_path['shuffle']}")
-    shuffle_idx = np.load(idx_path["shuffle"], allow_pickle=True, mmap_mode="r")
+        logger.debug(
+            "    loaded indexed file in {:3.3f} seconds".format(time.time() - start_time)
+        )
+    # else: doc_idx, sample_idx, shuffle_idx already in memory from building above
 
-    logger.debug(
-        "    loaded indexed file in {:3.3f} seconds".format(time.time() - start_time)
-    )
     logger.debug("    total number of samples: {}".format(sample_idx.shape[0]))
     logger.debug("    total number of epochs: {}".format(num_epochs))
 
