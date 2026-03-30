@@ -198,47 +198,85 @@ class BuildCorpusDataset(torch.utils.data.Dataset):
                 return _build_indices_concat()
 
         def _cache_indices():
-            corpus_name = self.dataset_builders[0].corpus
+            desc = self.dataset_builders[0].corpus
+            desc += (
+                f"\n {self.num_samples} "
+                f"+ blend_sample_in_corpus: {args.blend_sample_in_corpus}"
+                f"+ shuffle_sample_in_corpus: {args.shuffle_sample_in_corpus}"
+            )
             self.dataset_index = np.zeros(self.num_samples, dtype=np.int64)
             self.dataset_sample_index = np.zeros(self.num_samples, dtype=np.int64)
-
-            # Build on rank 0, broadcast to all ranks via torch.distributed.
-            # Filesystem caching is unreliable on parallel filesystems (Lustre).
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            if rank == 0:
-                logger.info(f"> building {corpus_name} corpus indices on rank 0 ...")
-                self.dataset_index, self.dataset_sample_index = _build_indices()
-                # Save cache for future single-rank reuse
-                if args.data_cache_path:
+            if args.data_cache_path:
+                desc_hash = hashlib.md5(desc.encode("utf-8")).hexdigest()
+                desc_path = os.path.join(args.data_cache_path, desc_hash + ".dsc")
+                index_path = os.path.join(
+                    args.data_cache_path, desc_hash + "_index.npy"
+                )
+                sample_index_path = os.path.join(
+                    args.data_cache_path, desc_hash + "_sample_index.npy"
+                )
+                cache_hit = os.path.isfile(index_path) and os.path.isfile(
+                    sample_index_path
+                )
+                cache_success = True
+                if torch.distributed.get_rank() == 0 and not cache_hit:
+                    print(
+                        " > WARNING: could not find index map files for blendable"
+                        " dataset, building indices on rank 0 ...",
+                        flush=True,
+                    )
+                    dataset_index, dataset_sample_index = _build_indices()
                     try:
-                        desc = corpus_name + (
-                            f"\n {self.num_samples} "
-                            f"+ blend_sample_in_corpus: {args.blend_sample_in_corpus}"
-                            f"+ shuffle_sample_in_corpus: {args.shuffle_sample_in_corpus}"
-                        )
-                        desc_hash = hashlib.md5(desc.encode("utf-8")).hexdigest()
-                        os.makedirs(args.data_cache_path, exist_ok=True)
-                        np.save(os.path.join(args.data_cache_path, desc_hash + "_index.npy"),
-                                self.dataset_index, allow_pickle=True)
-                        np.save(os.path.join(args.data_cache_path, desc_hash + "_sample_index.npy"),
-                                self.dataset_sample_index, allow_pickle=True)
-                        logger.info(
-                            f" > finished saving {corpus_name} corpus index map files"
-                        )
+                        logger.debug(" > saving index map files")
+                        start_time = time.perf_counter()
+                        os.makedirs(os.path.dirname(index_path), exist_ok=True)
+                        with open(desc_path, "wt") as fd:
+                            fd.write(desc)
+                            np.save(index_path, dataset_index, allow_pickle=True)
+                            np.save(
+                                sample_index_path,
+                                dataset_sample_index,
+                                allow_pickle=True,
+                            )
+                            logger.info(
+                                f" > finished saving {self.dataset_builders[0].corpus} corpus index map files in {time.perf_counter() - start_time} seconds"
+                            )
                     except OSError:
-                        logger.warning(f"> failed to save {corpus_name} corpus index cache")
-
-            # Broadcast from rank 0 to all ranks
-            if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-                idx_tensor = torch.from_numpy(self.dataset_index).long()
-                sample_tensor = torch.from_numpy(self.dataset_sample_index).long()
-                torch.distributed.broadcast(idx_tensor, src=0)
-                torch.distributed.broadcast(sample_tensor, src=0)
-                if rank != 0:
-                    self.dataset_index = idx_tensor.numpy()
-                    self.dataset_sample_index = sample_tensor.numpy()
-                logger.info(f"> rank {rank}: {corpus_name} corpus indices ready (broadcast)")
-            elif not torch.distributed.is_initialized():
+                        print(
+                            f"There was an error trying to create the data cache directory ({args.data_cache_path})"
+                        )
+                        print(
+                            "or a file in it. This is set with the --data-cache-path argument. Please"
+                        )
+                        print(
+                            "ensure you have write access to this directory or specify one that you do have"
+                        )
+                        print("write access to.")
+                        cache_success = False
+                    self.dataset_index = dataset_index
+                    self.dataset_sample_index = dataset_sample_index
+                torch.distributed.barrier(group=mpu.get_data_parallel_group())
+                torch.distributed.barrier(group=mpu.get_pipeline_model_parallel_group())
+                torch.distributed.barrier(group=mpu.get_data_parallel_group())
+                start_time = time.perf_counter()
+                logger.info(
+                    f"> loading {self.dataset_builders[0].corpus} corpus dataset index: {index_path}"
+                )
+                self.dataset_index = np.load(
+                    index_path, allow_pickle=True, mmap_mode="r"
+                )
+                assert self.dataset_index.size == self.num_samples
+                logger.info(
+                    f"> loading {self.dataset_builders[0].corpus} corpus dataset sample index: {sample_index_path}"
+                )
+                self.dataset_sample_index = np.load(
+                    sample_index_path, allow_pickle=True, mmap_mode="r"
+                )
+                assert self.dataset_sample_index.size == self.num_samples
+                logger.info(
+                    f"> finished loading in {time.perf_counter() - start_time} seconds"
+                )
+            else:
                 self.dataset_index, self.dataset_sample_index = _build_indices()
 
         _cache_indices()
@@ -1082,25 +1120,20 @@ def _build_index_mappings(
             print("write access to.")
             data_cache_success = False
 
-    if not build_indices:
-        # This rank didn't build — load from files written by another rank.
-        # The caller's barrier (in build_train_valid_test_datasets) ensures
-        # these files are fully written before we reach here.
-        start_time = time.time()
-        logger.debug(f" > loading doc-idx mapping from {idx_path['doc']}")
-        doc_idx = np.load(idx_path["doc"], allow_pickle=True, mmap_mode="r")
+    # Load mappings.
+    start_time = time.time()
+    logger.debug(f" > loading doc-idx mapping from {idx_path['doc']}")
+    doc_idx = np.load(idx_path["doc"], allow_pickle=True, mmap_mode="r")
 
-        logger.debug(f" > loading sample-idx mapping from {idx_path['sample']}")
-        sample_idx = np.load(idx_path["sample"], allow_pickle=True, mmap_mode="r")
+    logger.debug(f" > loading sample-idx mapping from {idx_path['sample']}")
+    sample_idx = np.load(idx_path["sample"], allow_pickle=True, mmap_mode="r")
 
-        logger.debug(f" > loading shuffle-idx mapping from {idx_path['shuffle']}")
-        shuffle_idx = np.load(idx_path["shuffle"], allow_pickle=True, mmap_mode="r")
+    logger.debug(f" > loading shuffle-idx mapping from {idx_path['shuffle']}")
+    shuffle_idx = np.load(idx_path["shuffle"], allow_pickle=True, mmap_mode="r")
 
-        logger.debug(
-            "    loaded indexed file in {:3.3f} seconds".format(time.time() - start_time)
-        )
-    # else: doc_idx, sample_idx, shuffle_idx already in memory from building above
-
+    logger.debug(
+        "    loaded indexed file in {:3.3f} seconds".format(time.time() - start_time)
+    )
     logger.debug("    total number of samples: {}".format(sample_idx.shape[0]))
     logger.debug("    total number of epochs: {}".format(num_epochs))
 
