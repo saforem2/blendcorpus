@@ -256,9 +256,10 @@ class BuildCorpusDataset(torch.utils.data.Dataset):
                         cache_success = False
                     self.dataset_index = dataset_index
                     self.dataset_sample_index = dataset_sample_index
-                torch.distributed.barrier(group=mpu.get_data_parallel_group())
-                torch.distributed.barrier(group=mpu.get_pipeline_model_parallel_group())
-                torch.distributed.barrier(group=mpu.get_data_parallel_group())
+                # Global barrier so that ALL ranks (including those in different
+                # TP groups) wait for rank 0 to finish writing cache files.
+                torch.distributed.barrier()
+
                 def _load_with_retry(path, label, max_retries=30, delay=2.0):
                     for attempt in range(max_retries):
                         try:
@@ -468,9 +469,9 @@ def build_train_valid_test_datasets(
         logger.debug(
             f" >>> Rank 0 - finished building datasets in {time.time() - start_time} seconds"
         )
-        torch.distributed.barrier(group=mpu.get_data_parallel_group())
-        torch.distributed.barrier(group=mpu.get_pipeline_model_parallel_group())
-        torch.distributed.barrier(group=mpu.get_data_parallel_group())
+        # Global barrier so that ALL ranks (including those in different
+        # TP groups) wait for dataset building to complete.
+        torch.distributed.barrier()
         logger.debug(
             f" >>> Finished building datasets (all ranks) in distributed way in {time.time() - start_time} seconds"
         )

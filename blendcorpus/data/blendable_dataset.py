@@ -123,9 +123,9 @@ class BlendableDataset(torch.utils.data.Dataset):
             #         torch.distributed.get_world_size(group=mpu.get_sequence_parallel_group())):
             #     logger.info("Data index creation unsuccessful, exiting.")
             #     exit()
-            torch.distributed.barrier(group=mpu.get_data_parallel_group())
-            torch.distributed.barrier(group=mpu.get_pipeline_model_parallel_group())
-            torch.distributed.barrier(group=mpu.get_data_parallel_group())
+            # Global barrier so that ALL ranks (including those in different
+            # TP groups) wait for rank 0 to finish writing cache files.
+            torch.distributed.barrier()
 
             def _load_with_retry(path, label, max_retries=30, delay=2.0):
                 for attempt in range(max_retries):
