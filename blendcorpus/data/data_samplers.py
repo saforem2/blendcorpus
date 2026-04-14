@@ -38,11 +38,12 @@ def build_pretraining_data_loader(dataset, consumed_samples, config):
                 config.dataloader_type))
 
     # Torch dataloader.
+    pin_memory = getattr(config, "pin_memory", torch.cuda.is_available())
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_sampler=batch_sampler,
         num_workers=config.num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         multiprocessing_context=(
             config.multiprocessing_context if config.num_workers > 0
             else None
