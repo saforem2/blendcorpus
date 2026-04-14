@@ -1135,6 +1135,11 @@ def _build_index_mappings(
             print("write access to.")
             data_cache_success = False
 
+    # Global barrier so all ranks finish building/saving before any rank loads.
+    # Without this, concurrent writes on parallel filesystems (Lustre) can
+    # corrupt files when multiple ranks write to the same paths.
+    torch.distributed.barrier()
+
     # Load mappings with retry — on parallel filesystems (Lustre), files
     # written by one rank may not be immediately visible/complete on other
     # nodes even after a barrier.
