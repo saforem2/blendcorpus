@@ -7,7 +7,6 @@ import torch
 import numpy as np
 from torch.utils.data import Dataset
 import blendcorpus.parallel_state as mpu
-from deepspeed.runtime.dataloader import RepeatingLoader
 
 
 def build_pretraining_data_loader(dataset, consumed_samples, config):
@@ -49,6 +48,7 @@ def build_pretraining_data_loader(dataset, consumed_samples, config):
         )
     )
     if config.repeated_dataloader:
+        from deepspeed.runtime.dataloader import RepeatingLoader
         loader=RepeatingLoader(loader)
     return loader
 

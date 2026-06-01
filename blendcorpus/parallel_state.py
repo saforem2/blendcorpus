@@ -2,6 +2,7 @@
 
 """Model and data parallel groups."""
 
+import ezpz
 import torch
 from typing import Optional
 
@@ -796,14 +797,16 @@ def broadcast_data_in_model_parallel_group(keys, data, datatype):
 
     key_size, key_numel, total_numel = _build_key_size_numel_dictionaries(
         keys, data, group=group, rank=rank, src_rank=src_rank)
-    from deepspeed.accelerator import get_accelerator
+    # from deepspeed.accelerator import get_accelerator
     # Pack on rank zero.
     if rank == 0:
         # Check that all keys have the same data type.
         _check_data_types(keys, data, datatype)
         # Flatten the data associated with the keys
+        # flatten_data = torch.cat(
+        #     [data[key].contiguous().view(-1) for key in keys], dim=0).to(get_accelerator().device_name())
         flatten_data = torch.cat(
-            [data[key].contiguous().view(-1) for key in keys], dim=0).to(get_accelerator().device_name())
+            [data[key].contiguous().view(-1) for key in keys], dim=0).to(ezpz.get_torch_device_type())
     else:
         flatten_data = torch.empty(total_numel,
                                    device=get_accelerator().current_device_name(),
