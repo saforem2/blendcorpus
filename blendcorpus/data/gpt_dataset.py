@@ -1132,17 +1132,19 @@ def _build_index_mappings(
             print("write access to.")
             data_cache_success = False
 
-    # Barrier between build and load. The build branch above is NOT gated to
-    # rank 0 -- every rank that finds the cache missing races to np.save the
-    # doc/sample/shuffle .npy, then every rank np.loads them below. Without a
-    # global sync, a rank can np.load a file another rank is still writing
-    # ("mmap length is greater than file size" / "EOF: reading magic string").
-    # The original "all ranks create then read, no contention" assumption is
-    # false at scale (seen on 80B TP=4, 744 ranks, validation-split build).
-    # A global barrier (default WORLD group) makes every rank wait for all
-    # writers before any reader proceeds.
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        torch.distributed.barrier()
+    # NOTE: deliberately NO torch.distributed.barrier() here. This function
+    # is called per-corpus x per-split (train/valid/test) via build_dataset,
+    # and whether a rank takes the build branch above is data-dependent
+    # (cache-hit vs miss). A global barrier in this path fires a mismatched
+    # number of times across ranks -> oneCCL allreduce_scaleout participation
+    # mismatch / hang ("atl_comm->wait fails with status: 1"), seen on 80B
+    # TP=4 / 744 ranks. The rare build-vs-read race here (a reader np.loading
+    # a file mid-write) is mitigated operationally by pre-warming the index
+    # cache before large runs (scripts/prewarm_blendcorpus_cache.sh); a
+    # deadlock is strictly worse than that rare race. The 3 barriers added in
+    # the sibling _cache_indices / build_corpus_datasets / blendable_dataset
+    # paths ARE safe -- those sit next to pre-existing all-rank subgroup
+    # barriers (proven collective call sites).
 
     # Load mappings.
     start_time = time.time()
