@@ -125,6 +125,14 @@ class BlendableDataset(torch.utils.data.Dataset):
             torch.distributed.barrier(group=mpu.get_data_parallel_group())
             torch.distributed.barrier(group=mpu.get_pipeline_model_parallel_group())
             torch.distributed.barrier(group=mpu.get_data_parallel_group())
+            # The DP/PP-group barriers above do NOT gate ranks whose TP
+            # coordinate != 0 against the global rank-0 writer: those ranks live
+            # in DP/PP subgroups that don't contain rank 0, so their subgroup
+            # barriers self-satisfy and they race ahead to np.load the blendable
+            # index before rank 0 has written it (FileNotFoundError across
+            # ~(1 - 1/TP) of ranks at TP>1). A global barrier makes every rank
+            # wait for the writer.
+            torch.distributed.barrier()
 
             start_time = time.perf_counter()
             logger.info(f"> loading blendable dataset index: {index_path}")

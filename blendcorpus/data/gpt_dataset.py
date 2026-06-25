@@ -258,6 +258,14 @@ class BuildCorpusDataset(torch.utils.data.Dataset):
                 torch.distributed.barrier(group=mpu.get_data_parallel_group())
                 torch.distributed.barrier(group=mpu.get_pipeline_model_parallel_group())
                 torch.distributed.barrier(group=mpu.get_data_parallel_group())
+                # The DP/PP-group barriers above do NOT gate ranks whose TP
+                # coordinate != 0 against the global rank-0 writer: those ranks
+                # live in DP/PP subgroups that don't contain rank 0, so their
+                # subgroup barriers self-satisfy and they race ahead to np.load
+                # the index before rank 0 has written it (FileNotFoundError /
+                # EOF / "mmap length > file size" across ~(1 - 1/TP) of ranks at
+                # TP>1). A global barrier makes every rank wait for the writer.
+                torch.distributed.barrier()
                 start_time = time.perf_counter()
                 logger.info(
                     f"> loading {self.dataset_builders[0].corpus} corpus dataset index: {index_path}"
@@ -457,6 +465,10 @@ def build_train_valid_test_datasets(
         torch.distributed.barrier(group=mpu.get_data_parallel_group())
         torch.distributed.barrier(group=mpu.get_pipeline_model_parallel_group())
         torch.distributed.barrier(group=mpu.get_data_parallel_group())
+        # DP/PP-group barriers don't gate TP-coord != 0 ranks against the
+        # global rank-0 builder (those ranks' subgroups exclude rank 0). Add a
+        # global barrier so all ranks wait for the cache writes before reading.
+        torch.distributed.barrier()
         logger.debug(
             f" >>> Finished building datasets (all ranks) in distributed way in {time.time() - start_time} seconds"
         )
