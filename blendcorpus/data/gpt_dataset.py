@@ -1132,6 +1132,18 @@ def _build_index_mappings(
             print("write access to.")
             data_cache_success = False
 
+    # Barrier between build and load. The build branch above is NOT gated to
+    # rank 0 -- every rank that finds the cache missing races to np.save the
+    # doc/sample/shuffle .npy, then every rank np.loads them below. Without a
+    # global sync, a rank can np.load a file another rank is still writing
+    # ("mmap length is greater than file size" / "EOF: reading magic string").
+    # The original "all ranks create then read, no contention" assumption is
+    # false at scale (seen on 80B TP=4, 744 ranks, validation-split build).
+    # A global barrier (default WORLD group) makes every rank wait for all
+    # writers before any reader proceeds.
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
     # Load mappings.
     start_time = time.time()
     logger.debug(f" > loading doc-idx mapping from {idx_path['doc']}")
