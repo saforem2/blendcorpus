@@ -28,6 +28,58 @@ logger = ezpz.get_logger(__name__)
 
 dlp = Profile("DATASET")
 
+
+def _atomic_np_save(path, array):
+    """Write a .npy file atomically: save to a unique temp path on the
+    same directory, then os.replace() it into place. os.replace is atomic
+    on POSIX within a filesystem, so a concurrent reader on another rank
+    either sees the old/absent file or the fully-written one -- never a
+    torn/half-written file. This closes the build-then-load race at TP>1
+    where rank 0 builds the index while other ranks np.load it
+    (manifesting as "mmap length is greater than file size" / "EOF:
+    reading magic string"). np.save appends ".npy" if missing, so we save
+    to "<tmp>" (which becomes "<tmp>.npy") and replace onto the final path.
+    """
+    final = path if path.endswith(".npy") else path + ".npy"
+    tmp = f"{final}.tmp.{os.getpid()}.{torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}"
+    np.save(tmp, array, allow_pickle=True)
+    saved = tmp if os.path.isfile(tmp) else tmp + ".npy"
+    os.replace(saved, final)
+
+
+def _wait_for_index_files(paths, timeout=1800.0, poll=0.5):
+    """Block until every path exists and is a fully-written .npy, or raise
+    on timeout. Used before np.load so a rank that did NOT build the index
+    (cache-hit branch, or a different rank than the builder) does not read
+    a file the builder is still producing. Polling files -- not a
+    torch.distributed collective -- so it is immune to the participation
+    -mismatch deadlock that a barrier hits in this per-corpus/per-split,
+    data-dependent call path (see the NOTE in _build_index_mappings). A
+    file is "complete" when it exists, is non-empty, and numpy can read its
+    header (np.load mmap validates the magic string + shape).
+    """
+    start = time.time()
+    for p in paths:
+        target = p if p.endswith(".npy") else p + ".npy"
+        while True:
+            ok = False
+            if os.path.isfile(target) and os.path.getsize(target) > 0:
+                try:
+                    # mmap load validates the .npy header without reading
+                    # the whole array; a torn file raises here.
+                    np.load(target, allow_pickle=True, mmap_mode="r")
+                    ok = True
+                except (ValueError, EOFError, OSError):
+                    ok = False
+            if ok:
+                break
+            if time.time() - start > timeout:
+                raise TimeoutError(
+                    f"index file not complete after {timeout:.0f}s: {target}"
+                )
+            time.sleep(poll)
+
+
 def build_gpt_datasets(config):
     files = []
     weights = []
@@ -232,11 +284,16 @@ class BuildCorpusDataset(torch.utils.data.Dataset):
                         os.makedirs(os.path.dirname(index_path), exist_ok=True)
                         with open(desc_path, "wt") as fd:
                             fd.write(desc)
-                            np.save(index_path, dataset_index, allow_pickle=True)
-                            np.save(
-                                sample_index_path,
-                                dataset_sample_index,
-                                allow_pickle=True,
+                            # Atomic writes (temp + os.replace) so a reader
+                            # racing in can't see a torn file. This path is
+                            # also gated by the global barrier below (which
+                            # is safe here -- _cache_indices is reached
+                            # uniformly by all ranks, unlike
+                            # _build_index_mappings); atomic save is
+                            # defense-in-depth on top of it.
+                            _atomic_np_save(index_path, dataset_index)
+                            _atomic_np_save(
+                                sample_index_path, dataset_sample_index
                             )
                             logger.info(
                                 f" > finished saving {self.dataset_builders[0].corpus} corpus index map files in {time.perf_counter() - start_time} seconds"
@@ -1074,7 +1131,7 @@ def _build_index_mappings(
             # doc-idx.
             start_time = time.time()
             doc_idx = _build_doc_idx(documents, num_epochs, np_rng, separate_last_epoch)
-            np.save(idx_path["doc"], doc_idx, allow_pickle=True)
+            _atomic_np_save(idx_path["doc"], doc_idx)
             logger.debug(
                 " > elasped time to build and save doc-idx mapping "
                 "(seconds): {:4f}".format(time.time() - start_time)
@@ -1095,7 +1152,7 @@ def _build_index_mappings(
                 tokens_per_epoch,
                 torch.distributed.get_rank() == 0,
             )
-            np.save(idx_path["sample"], sample_idx, allow_pickle=True)
+            _atomic_np_save(idx_path["sample"], sample_idx)
             logger.debug(
                 " > elasped time to build and save sample-idx mapping "
                 "(seconds): {:4f}".format(time.time() - start_time)
@@ -1111,7 +1168,7 @@ def _build_index_mappings(
             shuffle_idx = _build_shuffle_idx(
                 num_samples_, sample_idx.shape[0] - 1, np_rng
             )
-            np.save(idx_path["shuffle"], shuffle_idx, allow_pickle=True)
+            _atomic_np_save(idx_path["shuffle"], shuffle_idx)
             logger.debug(
                 " > elasped time to build and save shuffle-idx mapping"
                 " (seconds): {:4f}".format(time.time() - start_time)
@@ -1132,19 +1189,28 @@ def _build_index_mappings(
             print("write access to.")
             data_cache_success = False
 
-    # NOTE: deliberately NO torch.distributed.barrier() here. This function
-    # is called per-corpus x per-split (train/valid/test) via build_dataset,
-    # and whether a rank takes the build branch above is data-dependent
-    # (cache-hit vs miss). A global barrier in this path fires a mismatched
-    # number of times across ranks -> oneCCL allreduce_scaleout participation
-    # mismatch / hang ("atl_comm->wait fails with status: 1"), seen on 80B
-    # TP=4 / 744 ranks. The rare build-vs-read race here (a reader np.loading
-    # a file mid-write) is mitigated operationally by pre-warming the index
-    # cache before large runs (scripts/prewarm_blendcorpus_cache.sh); a
-    # deadlock is strictly worse than that rare race. The 3 barriers added in
-    # the sibling _cache_indices / build_corpus_datasets / blendable_dataset
-    # paths ARE safe -- those sit next to pre-existing all-rank subgroup
-    # barriers (proven collective call sites).
+    # Build-then-load race fix (deadlock-free). This function is called
+    # per-corpus x per-split via build_dataset, and whether a rank takes the
+    # build branch above is data-dependent (cache-hit vs miss), so a
+    # torch.distributed.barrier() here fires a mismatched number of times
+    # across ranks -> oneCCL allreduce_scaleout participation mismatch / hang
+    # ("atl_comm->wait fails with status: 1"), seen on 80B TP=4 / 744 ranks
+    # (this is why an earlier barrier attempt was reverted). Instead we make
+    # the race impossible without any collective:
+    #   1. the builder writes each .npy atomically (_atomic_np_save: temp +
+    #      os.replace), so a reader never sees a torn file; and
+    #   2. every rank polls until all three files are complete
+    #      (_wait_for_index_files) before np.load, so a non-builder rank
+    #      (cache-hit branch, or simply a different rank than the builder)
+    #      cannot read an index another rank is still producing.
+    # File-polling instead of a barrier => immune to the participation
+    # -mismatch deadlock regardless of the data-dependent call count. The 3
+    # barriers in the sibling _cache_indices / build_corpus_datasets /
+    # blendable_dataset paths remain (they sit next to pre-existing all-rank
+    # subgroup barriers and are reached uniformly).
+    _wait_for_index_files(
+        [idx_path["doc"], idx_path["sample"], idx_path["shuffle"]]
+    )
 
     # Load mappings.
     start_time = time.time()
