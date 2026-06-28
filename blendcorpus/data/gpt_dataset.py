@@ -63,14 +63,19 @@ def _wait_for_index_files(paths, timeout=1800.0, poll=0.5):
         target = p if p.endswith(".npy") else p + ".npy"
         while True:
             ok = False
-            if os.path.isfile(target) and os.path.getsize(target) > 0:
-                try:
-                    # mmap load validates the .npy header without reading
-                    # the whole array; a torn file raises here.
+            try:
+                # Probe + validate inside the try so EVERY filesystem access on
+                # `target` is covered. os.path.getsize raises FileNotFoundError
+                # (an OSError) if the builder's os.replace swaps `target`
+                # between our checks -- a TOCTOU that previously escaped because
+                # the size probe sat outside the try. mmap load then validates
+                # the .npy header without reading the whole array; a torn file
+                # raises here too.
+                if os.path.getsize(target) > 0:
                     np.load(target, allow_pickle=True, mmap_mode="r")
                     ok = True
-                except (ValueError, EOFError, OSError):
-                    ok = False
+            except (ValueError, EOFError, OSError):
+                ok = False
             if ok:
                 break
             if time.time() - start > timeout:
