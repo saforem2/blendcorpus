@@ -317,17 +317,23 @@ class BuildCorpusDataset(torch.utils.data.Dataset):
                         cache_success = False
                     self.dataset_index = dataset_index
                     self.dataset_sample_index = dataset_sample_index
-                torch.distributed.barrier(group=mpu.get_data_parallel_group())
-                torch.distributed.barrier(group=mpu.get_pipeline_model_parallel_group())
-                torch.distributed.barrier(group=mpu.get_data_parallel_group())
-                # The DP/PP-group barriers above do NOT gate ranks whose TP
-                # coordinate != 0 against the global rank-0 writer: those ranks
-                # live in DP/PP subgroups that don't contain rank 0, so their
-                # subgroup barriers self-satisfy and they race ahead to np.load
-                # the index before rank 0 has written it (FileNotFoundError /
-                # EOF / "mmap length > file size" across ~(1 - 1/TP) of ranks at
-                # TP>1). A global barrier makes every rank wait for the writer.
-                torch.distributed.barrier()
+                # Poll the files until rank 0 has finished writing them,
+                # instead of a barrier. The DP/PP-group barriers do NOT gate
+                # ranks whose TP coordinate != 0 against the global rank-0
+                # writer (their subgroups exclude rank 0, so the subgroup
+                # barriers self-satisfy and they race ahead to np.load before
+                # rank 0 has written -- FileNotFoundError / EOF / "mmap length
+                # > file size" across ~(1 - 1/TP) of ranks at TP>1, observed on
+                # agpt_20b TP=1 @ 192 ranks cold-build, job 12469786). A plain
+                # global torch.distributed.barrier() here is unsafe: this load
+                # path is reachable non-uniformly across ranks (cache-hit vs
+                # cold-build branch), so a collective barrier risks the same
+                # participation-mismatch hang we hit + reverted in
+                # _build_index_mappings (commit 74b09fd). _wait_for_index_files
+                # is a file poll (no collective), immune to that, and pairs
+                # with the _atomic_np_save above (temp + os.replace) so a
+                # reader sees either no file or the complete file -- never torn.
+                _wait_for_index_files([index_path, sample_index_path])
                 start_time = time.perf_counter()
                 logger.info(
                     f"> loading {self.dataset_builders[0].corpus} corpus dataset index: {index_path}"
